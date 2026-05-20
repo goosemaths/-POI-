@@ -4,6 +4,7 @@ import { createServer as createViteServer } from "vite";
 import duckdb from 'duckdb';
 const { Database } = duckdb;
 import fs from 'fs';
+import https from 'https';
 
 // BigInt JSON serialization patch
 (BigInt.prototype as any).toJSON = function() {
@@ -11,11 +12,14 @@ import fs from 'fs';
 };
 
 const app = express();
-// 修复 1：动态获取 Render 提供的端口，避免绑定失败
 const PORT = process.env.PORT || 3000;
 
-// Initialize DuckDB (In-memory)
+// Initialize DuckDB
 const db = new Database(':memory:');
+
+// 优化 1：严格限制 DuckDB 的内存使用和线程数，防止 512MB 内存溢出
+db.run("PRAGMA memory_limit='128MB';");
+db.run("PRAGMA threads=1;");
 
 // Helper to run DuckDB queries
 const query = (sql: string): Promise<any[]> => {
@@ -30,21 +34,53 @@ const query = (sql: string): Promise<any[]> => {
 const PARQUET_URL = "https://huggingface.co/datasets/goosemaths/tianjin-pm25-data/resolve/main/tianjin_pm25_predictions.parquet";
 const LOCAL_PARQUET_PATH = path.resolve(process.cwd(), 'tianjin_pm25_predictions.parquet');
 
-// 修复 2：使用更稳定的内置 fetch API 自动处理重定向与文件写入
-async function downloadFile(url: string, dest: string): Promise<void> {
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`HTTP error! status: ${response.status}`);
-  }
-  const arrayBuffer = await response.arrayBuffer();
-  await fs.promises.writeFile(dest, Buffer.from(arrayBuffer));
+// 优化 2：采用流式（Stream Pipe）下载，数据直接落盘，不占用 Node.js 内存运行空间
+function downloadFile(url: string, dest: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const request = https.get(url, (response) => {
+      // 释放未使用的重定向连接
+      if (response.statusCode === 301 || response.statusCode === 302) {
+        response.resume(); 
+        const redirectUrl = response.headers.location;
+        if (redirectUrl) {
+          downloadFile(redirectUrl, dest).then(resolve).catch(reject);
+        } else {
+          reject(new Error("Redirect location missing"));
+        }
+        return;
+      }
+
+      if (response.statusCode !== 200) {
+        response.resume();
+        reject(new Error(`Failed to download: ${response.statusCode}`));
+        return;
+      }
+
+      const file = fs.createWriteStream(dest);
+      response.pipe(file);
+
+      file.on('finish', () => {
+        file.close();
+        resolve();
+      });
+
+      file.on('error', (err) => {
+        fs.unlink(dest, () => {}); 
+        reject(err);
+      });
+    });
+
+    request.on('error', (err) => {
+      reject(err);
+    });
+  });
 }
 
 async function startServer() {
   const csvFile = path.resolve(process.cwd(), 'grid_static_attributes.csv');
   const jsonFile = path.resolve(process.cwd(), 'data.json');
 
-  // 启动时同步 Parquet 数据
+  // 启动下载
   if (!fs.existsSync(LOCAL_PARQUET_PATH)) {
     console.log(`[Hugging Face] Downloading parquet from ${PARQUET_URL}...`);
     try {
@@ -75,7 +111,6 @@ async function startServer() {
         `);
         return res.json(result.map(r => r.key).sort());
       }
-      
       res.status(404).json({ error: "Data files not found" });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
@@ -160,7 +195,6 @@ async function startServer() {
     });
   }
 
-  // 绑定至 Render 分配的端口
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on port ${PORT}`);
   });
