@@ -11,7 +11,7 @@ import fs from 'fs';
 };
 
 // 1. 【修改点一】设置远程 Parquet 文件直链（请替换为您实际的 URL）
-const PARQUET_URL = "https://github.com/goosemaths/-POI-/releases/download/v1.0.0/tianjin_pm25_predictions.parquet";
+const PARQUET_URL = "https://huggingface.co/datasets/goosemaths/tianjin-pm25-data/blob/main/tianjin_pm25_predictions.parquet";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
