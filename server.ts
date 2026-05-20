@@ -15,16 +15,16 @@ const PORT = process.env.PORT || 3000;
 
 let isPredictionsReady = false;
 
-const DB_PATH = '/tmp/local_cache.db';
+// 优化：升级缓存文件名，彻底杜绝之前残留的损坏/空数据缓存
+const DB_PATH = '/tmp/local_cache_v3.db'; 
 const LOCAL_PARQUET_PATH = '/tmp/tianjin_pm25_predictions.parquet';
 const PARQUET_URL = "https://huggingface.co/datasets/goosemaths/tianjin-pm25-data/resolve/main/tianjin_pm25_predictions.parquet";
 
 const db = new Database(DB_PATH);
 
-// 优化：合理调整内存限制和配置，防止 OOM
-db.run("PRAGMA memory_limit='256MB';"); // 提高至 256MB 保证分配空间
+db.run("PRAGMA memory_limit='256MB';"); 
 db.run("PRAGMA threads=1;");
-db.run("SET preserve_insertion_order=false;"); // 禁用插入顺序保留以降低内存开销
+db.run("SET preserve_insertion_order=false;"); 
 
 const query = (sql: string, params: any[] = []): Promise<any[]> => {
   return new Promise((resolve, reject) => {
@@ -62,12 +62,27 @@ function downloadFile(url: string, dest: string): Promise<void> {
   });
 }
 
-// 步骤 1：同步加载静态网格数据
+// 步骤 1：同步加载静态网格数据（带行数校验）
 async function initStaticGrids() {
   const csvFile = path.resolve(process.cwd(), 'grid_static_attributes.csv');
+  
+  let needsLoad = true;
   const hasStaticTable = await query("SELECT table_name FROM information_schema.tables WHERE table_name = 'static_grids'");
   
-  if (hasStaticTable.length === 0 && fs.existsSync(csvFile)) {
+  if (hasStaticTable.length > 0) {
+    // 校验：如果表存在但行数为 0，说明是上次崩溃遗留的坏账，必须删表重装
+    const countRes = await query("SELECT COUNT(*) as count FROM static_grids");
+    const count = Number(countRes[0]?.count || 0);
+    if (count > 0) {
+      needsLoad = false;
+      console.log(`[DuckDB] static_grids already cached with ${count} rows.`);
+    } else {
+      console.log("[DuckDB] static_grids is empty (corrupted cache). Dropping...");
+      await query("DROP TABLE IF EXISTS static_grids;");
+    }
+  }
+
+  if (needsLoad && fs.existsSync(csvFile)) {
     console.log("[DuckDB] Loading static grids to disk cache...");
     const normalizedCsv = csvFile.replace(/\\/g, '/');
     try {
@@ -85,21 +100,35 @@ async function initStaticGrids() {
           CAST(cnt_catering AS INTEGER) as cnt_catering
         FROM read_csv_auto('${normalizedCsv}')
       `);
-      console.log("[DuckDB] Static grids loaded successfully.");
+      const countRes = await query("SELECT COUNT(*) as count FROM static_grids");
+      console.log(`[DuckDB] Static grids loaded successfully. Total rows: ${countRes[0].count}`);
     } catch (err) {
-      // 容错处理：导入失败时清理半截表格，防止下次启动报错
       await query("DROP TABLE IF EXISTS static_grids;");
       throw err;
     }
   }
 }
 
-// 步骤 2：异步加载时序数据
+// 步骤 2：异步加载预测数据（带行数校验）
 async function initPredictions() {
   const jsonFile = path.resolve(process.cwd(), 'data.json');
+  
+  let needsLoad = true;
   const hasPredictionsTable = await query("SELECT table_name FROM information_schema.tables WHERE table_name = 'predictions'");
   
-  if (hasPredictionsTable.length === 0) {
+  if (hasPredictionsTable.length > 0) {
+    const countRes = await query("SELECT COUNT(*) as count FROM predictions");
+    const count = Number(countRes[0]?.count || 0);
+    if (count > 0) {
+      needsLoad = false;
+      console.log(`[DuckDB] predictions already cached with ${count} rows.`);
+    } else {
+      console.log("[DuckDB] predictions is empty (corrupted cache). Dropping...");
+      await query("DROP TABLE IF EXISTS predictions;");
+    }
+  }
+
+  if (needsLoad) {
     try {
       if (fs.existsSync(LOCAL_PARQUET_PATH)) {
         console.log("[DuckDB] Importing predictions from Parquet to disk...");
@@ -128,6 +157,8 @@ async function initPredictions() {
         `);
         await query(`CREATE INDEX IF NOT EXISTS idx_pred_dt ON predictions (dt)`);
       }
+      const countRes = await query("SELECT COUNT(*) as count FROM predictions");
+      console.log(`[DuckDB] Predictions loaded successfully. Total rows: ${countRes[0].count}`);
     } catch (err) {
       await query("DROP TABLE IF EXISTS predictions;");
       throw err;
@@ -149,7 +180,7 @@ async function runBackgroundInitialization() {
   }
 }
 
-// 状态拦截
+// 拦截状态
 app.use((req, res, next) => {
   const isPredictionApi = req.path.startsWith('/api/timestamps') || req.path.startsWith('/api/data');
   if (isPredictionApi && !isPredictionsReady) {
