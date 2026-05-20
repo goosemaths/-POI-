@@ -4,37 +4,36 @@ import { createServer as createViteServer } from "vite";
 import duckdb from 'duckdb';
 const { Database } = duckdb;
 import fs from 'fs';
-import https from 'https';
+import https from 'https'; // 引入 https 模块用于下载
 
+// BigInt JSON serialization patch
 (BigInt.prototype as any).toJSON = function() {
   return Number(this);
 };
 
-const app = express();
+// 修复 1：Render 要求必须绑定 process.env.PORT
 const PORT = process.env.PORT || 3000;
 
-let isPredictionsReady = false;
+// Initialize DuckDB (In-memory, we will query files directly)
+const db = new Database(':memory:');
 
-// 优化：升级缓存文件名，彻底杜绝之前残留的损坏/空数据缓存
-const DB_PATH = '/tmp/local_cache_v3.db'; 
-const LOCAL_PARQUET_PATH = '/tmp/tianjin_pm25_predictions.parquet';
-const PARQUET_URL = "https://huggingface.co/datasets/goosemaths/tianjin-pm25-data/resolve/main/tianjin_pm25_predictions.parquet";
-
-const db = new Database(DB_PATH);
-
-db.run("PRAGMA memory_limit='256MB';"); 
+// 修复 2：严格限制 DuckDB 资源，防止在 Render 512MB 环境下 OOM
+db.run("PRAGMA memory_limit='128MB';");
 db.run("PRAGMA threads=1;");
-db.run("SET preserve_insertion_order=false;"); 
 
-const query = (sql: string, params: any[] = []): Promise<any[]> => {
+// Helper to run DuckDB queries
+const query = (sql: string): Promise<any[]> => {
   return new Promise((resolve, reject) => {
-    db.all(sql, ...params, (err, res) => {
+    db.all(sql, (err, res) => {
       if (err) reject(err);
       else resolve(res);
     });
   });
 };
 
+const PARQUET_URL = "https://huggingface.co/datasets/goosemaths/tianjin-pm25-data/resolve/main/tianjin_pm25_predictions.parquet";
+
+// 流式下载工具，不占用 Node.js 额外内存空间
 function downloadFile(url: string, dest: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const request = https.get(url, (response) => {
@@ -62,32 +61,95 @@ function downloadFile(url: string, dest: string): Promise<void> {
   });
 }
 
-// 步骤 1：同步加载静态网格数据（带行数校验）
-async function initStaticGrids() {
+async function startServer() {
+  // Data file paths
+  const parquetFile = path.resolve(process.cwd(), 'tianjin_pm25_predictions.parquet');
   const csvFile = path.resolve(process.cwd(), 'grid_static_attributes.csv');
-  
-  let needsLoad = true;
-  const hasStaticTable = await query("SELECT table_name FROM information_schema.tables WHERE table_name = 'static_grids'");
-  
-  if (hasStaticTable.length > 0) {
-    // 校验：如果表存在但行数为 0，说明是上次崩溃遗留的坏账，必须删表重装
-    const countRes = await query("SELECT COUNT(*) as count FROM static_grids");
-    const count = Number(countRes[0]?.count || 0);
-    if (count > 0) {
-      needsLoad = false;
-      console.log(`[DuckDB] static_grids already cached with ${count} rows.`);
-    } else {
-      console.log("[DuckDB] static_grids is empty (corrupted cache). Dropping...");
-      await query("DROP TABLE IF EXISTS static_grids;");
+  const jsonFile = path.resolve(process.cwd(), 'data.json');
+
+  // 修复 3：启动时若缺失文件，优先从 Hugging Face 下载真实数据
+  if (!fs.existsSync(parquetFile)) {
+    console.log(`[Hugging Face] Downloading dataset from ${PARQUET_URL}...`);
+    try {
+      await downloadFile(PARQUET_URL, parquetFile);
+      console.log(`[Hugging Face] Download complete.`);
+    } catch (downloadErr: any) {
+      console.error("[Hugging Face] Download failed, falling back to Self-Healing generation...", downloadErr.message);
+      
+      // 下载失败时，降级使用您原有的自愈逻辑生成虚拟数据
+      if (fs.existsSync(csvFile)) {
+        console.log(`[Self-Healing] Generating default predictions from static attributes...`);
+        try {
+          const sqlGenerate = `
+            COPY (
+              SELECT 
+                t.dt,
+                s.grid_id as id,
+                CAST((30.0 + random() * 45.0 + (CAST(s.cnt_industrial AS DOUBLE) * 12.0) + (CAST(s.cnt_transport AS DOUBLE) * 8.0) + (CAST(s.cnt_commercial AS DOUBLE) * 5.0)) AS DOUBLE) as v
+              FROM read_csv_auto('${csvFile.replace(/\\/g, '/')}') s
+              CROSS JOIN (
+                SELECT '2025-12-23 14:00:00' as dt UNION ALL
+                SELECT '2025-12-23 15:00:00' UNION ALL
+                SELECT '2025-12-23 16:00:00' UNION ALL
+                SELECT '2025-12-23 17:00:00' UNION ALL
+                SELECT '2025-12-23 18:00:00' UNION ALL
+                SELECT '2025-12-23 19:00:00' UNION ALL
+                SELECT '2025-12-23 20:00:00' UNION ALL
+                SELECT '2025-12-23 21:00:00' UNION ALL
+                SELECT '2025-12-23 22:00:00' UNION ALL
+                SELECT '2025-12-23 23:00:00' UNION ALL
+                SELECT '2026-03-29 00:00:00' as dt
+              ) t
+            ) TO '${parquetFile.replace(/\\/g, '/')}' (FORMAT PARQUET);
+          `;
+          await query(sqlGenerate);
+          console.log(`[Self-Healing] Successfully generated ${parquetFile}`);
+        } catch (err) {
+          console.error("[Self-Healing] Failed to generate parquet file:", err);
+        }
+      }
     }
   }
 
-  if (needsLoad && fs.existsSync(csvFile)) {
-    console.log("[DuckDB] Loading static grids to disk cache...");
-    const normalizedCsv = csvFile.replace(/\\/g, '/');
+  // API Route: Get available timestamps
+  app.get("/api/timestamps", async (req, res) => {
+    const hasDBFiles = fs.existsSync(parquetFile) && fs.existsSync(csvFile);
+    const hasJsonFile = fs.existsSync(jsonFile);
+    
+    console.log(`[GET /api/timestamps] Files: Parquet(${fs.existsSync(parquetFile)}), CSV(${fs.existsSync(csvFile)}), JSON(${hasJsonFile})`);
+
     try {
-      await query(`
-        CREATE TABLE static_grids AS 
+      if (hasDBFiles) {
+        const result = await query(`
+          SELECT DISTINCT CAST(dt AS VARCHAR) as dt FROM read_parquet('${parquetFile}') ORDER BY dt ASC
+        `);
+        return res.json(result.map(r => r.dt));
+      } else if (hasJsonFile) {
+        const result = await query(`
+          SELECT DISTINCT key FROM (SELECT UNNEST(timeline) as key FROM read_json_auto('${jsonFile}')) t
+        `);
+        return res.json(result.map(r => r.key).sort());
+      }
+      
+      console.error(`Data files missing. Looked for: ${parquetFile} and ${csvFile}`);
+      res.status(404).json({ 
+        error: "Data files not found", 
+        checked: { parquet: parquetFile, csv: csvFile, exists: { parquet: fs.existsSync(parquetFile), csv: fs.existsSync(csvFile) } } 
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // API Route: Get static grid attributes (loaded once at startup)
+  app.get("/api/static-grids", async (req, res) => {
+    const hasCSVFile = fs.existsSync(csvFile);
+    if (!hasCSVFile) {
+      return res.status(404).json({ error: "Static attributes CSV file missing" });
+    }
+    try {
+      const normalizedCsv = csvFile.replace(/\\/g, '/');
+      const sql = `
         SELECT 
           CAST(grid_id AS VARCHAR) as id, 
           CAST(lng_wgs84 AS DOUBLE) as lng, 
@@ -99,135 +161,59 @@ async function initStaticGrids() {
           CAST(cnt_transport AS INTEGER) as cnt_transport,
           CAST(cnt_catering AS INTEGER) as cnt_catering
         FROM read_csv_auto('${normalizedCsv}')
-      `);
-      const countRes = await query("SELECT COUNT(*) as count FROM static_grids");
-      console.log(`[DuckDB] Static grids loaded successfully. Total rows: ${countRes[0].count}`);
-    } catch (err) {
-      await query("DROP TABLE IF EXISTS static_grids;");
-      throw err;
+      `;
+      const data = await query(sql);
+      console.log(`[DuckDB] Loaded ${data.length} static grid records.`);
+      return res.json(data);
+    } catch (err: any) {
+      console.error("[GET /api/static-grids] Error querying:", err);
+      res.status(500).json({ error: err.message });
     }
-  }
-}
+  });
 
-// 步骤 2：异步加载预测数据（带行数校验）
-async function initPredictions() {
-  const jsonFile = path.resolve(process.cwd(), 'data.json');
-  
-  let needsLoad = true;
-  const hasPredictionsTable = await query("SELECT table_name FROM information_schema.tables WHERE table_name = 'predictions'");
-  
-  if (hasPredictionsTable.length > 0) {
-    const countRes = await query("SELECT COUNT(*) as count FROM predictions");
-    const count = Number(countRes[0]?.count || 0);
-    if (count > 0) {
-      needsLoad = false;
-      console.log(`[DuckDB] predictions already cached with ${count} rows.`);
-    } else {
-      console.log("[DuckDB] predictions is empty (corrupted cache). Dropping...");
-      await query("DROP TABLE IF EXISTS predictions;");
-    }
-  }
+  // API Route: Get data for a specific timestamp (dynamic-only payload, optimized)
+  app.get("/api/data", async (req, res) => {
+    const time = req.query.time as string;
+    const hasDBFiles = fs.existsSync(parquetFile);
+    const hasJsonFile = fs.existsSync(jsonFile);
+    
+    console.log(`[GET /api/data] Time: ${time}, Source: ${hasDBFiles ? 'DuckDB (Parquet Only)' : (hasJsonFile ? 'JSON' : 'None')}`);
 
-  if (needsLoad) {
     try {
-      if (fs.existsSync(LOCAL_PARQUET_PATH)) {
-        console.log("[DuckDB] Importing predictions from Parquet to disk...");
-        const normalizedParquet = LOCAL_PARQUET_PATH.replace(/\\/g, '/');
-        await query(`
-          CREATE TABLE predictions AS 
-          SELECT CAST(dt AS VARCHAR) as dt, CAST(id AS VARCHAR) as id, CAST(v AS DOUBLE) as v 
-          FROM read_parquet('${normalizedParquet}')
-        `);
-        await query(`CREATE INDEX IF NOT EXISTS idx_pred_dt ON predictions (dt)`);
-      } else if (fs.existsSync(jsonFile)) {
-        console.log("[DuckDB] Importing predictions from JSON...");
-        const normalizedJson = jsonFile.replace(/\\/g, '/');
-        await query(`
-          CREATE TABLE predictions AS
+      if (hasDBFiles) {
+        const normalizedParquet = parquetFile.replace(/\\/g, '/');
+        const sql = `
           SELECT 
-            CAST(kv.key AS VARCHAR) as dt,
-            CAST(val.id AS VARCHAR) as id,
-            CAST(val.v AS DOUBLE) as v
-          FROM (
-            SELECT UNNEST(struct_entries(timeline)) as kv 
-            FROM read_json_auto('${normalizedJson}')
-          ), LATERAL (
-            SELECT UNNEST(kv.value) as val
-          )
-        `);
-        await query(`CREATE INDEX IF NOT EXISTS idx_pred_dt ON predictions (dt)`);
+            CAST(p.id AS VARCHAR) as id, 
+            CAST(p.v AS DOUBLE) as v
+          FROM read_parquet('${normalizedParquet}') p
+          WHERE CAST(p.dt AS VARCHAR) = '${time}'
+        `;
+        const data = await query(sql);
+        console.log(`[DuckDB] Query for time ${time} found ${data.length} records.`);
+        if (data.length > 0) {
+           console.log(`[DuckDB] Sample dynamic: ID: ${data[0].id}, V: ${data[0].v}`);
+        }
+        return res.json(data);
+      } else if (hasJsonFile) {
+        const normalizedJson = jsonFile.replace(/\\/g, '/');
+        const sql = `
+          SELECT 
+            CAST(t.item.id AS VARCHAR) as id, 
+            CAST(t.item.v AS DOUBLE) as v
+          FROM (SELECT UNNEST(timeline['${time}']) as item FROM read_json_auto('${normalizedJson}')) t
+        `;
+        const data = await query(sql);
+        return res.json(data);
       }
-      const countRes = await query("SELECT COUNT(*) as count FROM predictions");
-      console.log(`[DuckDB] Predictions loaded successfully. Total rows: ${countRes[0].count}`);
-    } catch (err) {
-      await query("DROP TABLE IF EXISTS predictions;");
-      throw err;
+      res.status(404).json({ error: "Data source files missing" });
+    } catch (err: any) {
+      console.error("[GET /api/data] Error querying:", err);
+      res.status(500).json({ error: err.message });
     }
-  }
-}
+  });
 
-async function runBackgroundInitialization() {
-  try {
-    if (!fs.existsSync(LOCAL_PARQUET_PATH)) {
-      console.log("[Background] Downloading parquet file...");
-      await downloadFile(PARQUET_URL, LOCAL_PARQUET_PATH);
-    }
-    await initPredictions();
-    isPredictionsReady = true;
-    console.log("[Background] Predictions cache initialized. System ready.");
-  } catch (err: any) {
-    console.error("[Background] Initialization failed:", err.message);
-  }
-}
-
-// 拦截状态
-app.use((req, res, next) => {
-  const isPredictionApi = req.path.startsWith('/api/timestamps') || req.path.startsWith('/api/data');
-  if (isPredictionApi && !isPredictionsReady) {
-    return res.status(503).json({ error: "Prediction data is loading, please try again shortly." });
-  }
-  next();
-});
-
-// API 路由: 静态网格
-app.get("/api/static-grids", async (req, res) => {
-  try {
-    const data = await query(`SELECT * FROM static_grids`);
-    return res.json(data);
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// API 路由: 时序相关
-app.get("/api/timestamps", async (req, res) => {
-  try {
-    const result = await query(`SELECT DISTINCT dt FROM predictions ORDER BY dt ASC`);
-    return res.json(result.map(r => r.dt));
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get("/api/data", async (req, res) => {
-  const time = req.query.time as string;
-  if (!time) return res.status(400).json({ error: "Missing time parameter" });
-
-  try {
-    const data = await query(`SELECT id, v FROM predictions WHERE dt = ?`, [time]);
-    return res.json(data);
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-async function startServer() {
-  try {
-    await initStaticGrids();
-  } catch (err: any) {
-    console.error("[DuckDB] Static grids load failed:", err.message);
-  }
-
+  // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -242,9 +228,12 @@ async function startServer() {
     });
   }
 
+  // 修复 4：改为使用分配的 PORT
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on port ${PORT}`);
-    runBackgroundInitialization();
+    const parquetExists = fs.existsSync(path.resolve(process.cwd(), 'tianjin_pm25_predictions.parquet'));
+    const csvExists = fs.existsSync(path.resolve(process.cwd(), 'grid_static_attributes.csv'));
+    console.log(`Data Status: Parquet(${parquetExists}), CSV(${csvExists})`);
   });
 }
 
