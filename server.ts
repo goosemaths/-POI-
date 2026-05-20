@@ -10,17 +10,11 @@ import fs from 'fs';
   return Number(this);
 };
 
-// 1. 【修改点一】设置远程 Parquet 文件直链（请替换为您实际的 URL）
-const PARQUET_URL = "https://huggingface.co/datasets/goosemaths/tianjin-pm25-data/blob/main/tianjin_pm25_predictions.parquet";
-
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = 3000;
 
-// Initialize DuckDB (In-memory, we will query files directly)
+// Initialize DuckDB (In-memory)
 const db = new Database(':memory:');
-
-// 2. 【修改点二】加载网络读取插件（因为 Parquet 在远程，必须加载）
-db.run("INSTALL httpfs; LOAD httpfs;");
 
 // Helper to run DuckDB queries
 const query = (sql: string): Promise<any[]> => {
@@ -32,51 +26,60 @@ const query = (sql: string): Promise<any[]> => {
   });
 };
 
+// Hugging Face 直链需使用 /resolve/ 获取原始文件
+const PARQUET_URL = "https://huggingface.co/datasets/goosemaths/tianjin-pm25-data/resolve/main/tianjin_pm25_predictions.parquet";
+
 async function startServer() {
-  // 本地 CSV 路径保持原样
+  const PORT = 3000;
+  
+  // Data file paths
   const csvFile = path.resolve(process.cwd(), 'grid_static_attributes.csv');
   const jsonFile = path.resolve(process.cwd(), 'data.json');
 
-  // 【修改点三】移除了自愈逻辑（因为 Parquet 放在云端，不再需要本地自动生成）
-  console.log(`[DuckDB] Initialization:\n- Remote Parquet: ${PARQUET_URL}\n- Local CSV: ${csvFile}`);
+  // 初始化 DuckDB 加载 httpfs 扩展以支持 HTTPS 读取
+  try {
+    await query("INSTALL httpfs; LOAD httpfs;");
+    console.log("[DuckDB] Loaded httpfs extension successfully.");
+  } catch (err) {
+    console.error("[DuckDB] Failed to load httpfs extension:", err);
+  }
 
   // API Route: Get available timestamps
   app.get("/api/timestamps", async (req, res) => {
-    // 检查本地 CSV 是否存在，并默认远程 Parquet 可访问
-    const hasDBFiles = fs.existsSync(csvFile);
     const hasJsonFile = fs.existsSync(jsonFile);
     
-    console.log(`[GET /api/timestamps] Querying timestamps...`);
+    console.log(`[GET /api/timestamps] Source: Remote Parquet`);
 
     try {
-      if (hasDBFiles) {
-        // 读取远程 Parquet 获取时间戳
-        const result = await query(`
-          SELECT DISTINCT CAST(dt AS VARCHAR) as dt FROM read_parquet('${PARQUET_URL}') ORDER BY dt ASC
-        `);
-        return res.json(result.map(r => r.dt));
-      } else if (hasJsonFile) {
-        const result = await query(`
-          SELECT DISTINCT key FROM (SELECT UNNEST(timeline) as key FROM read_json_auto('${jsonFile}')) t
-        `);
-        return res.json(result.map(r => r.key).sort());
-      }
-      
-      console.error(`Local CSV file missing. Looked for: ${csvFile}`);
-      res.status(404).json({ error: "Required local CSV file not found" });
+      // 优先从远程 Parquet 读取
+      const result = await query(`
+        SELECT DISTINCT CAST(dt AS VARCHAR) as dt FROM read_parquet('${PARQUET_URL}') ORDER BY dt ASC
+      `);
+      return res.json(result.map(r => r.dt));
     } catch (err: any) {
+      console.warn("[GET /api/timestamps] Remote parquet failed, trying JSON fallback:", err.message);
+      
+      if (hasJsonFile) {
+        try {
+          const result = await query(`
+            SELECT DISTINCT key FROM (SELECT UNNEST(timeline) as key FROM read_json_auto('${jsonFile}')) t
+          `);
+          return res.json(result.map(r => r.key).sort());
+        } catch (jsonErr: any) {
+          return res.status(500).json({ error: jsonErr.message });
+        }
+      }
       res.status(500).json({ error: err.message });
     }
   });
 
-  // API Route: Get static grid attributes (直接读取本地 CSV)
+  // API Route: Get static grid attributes
   app.get("/api/static-grids", async (req, res) => {
     const hasCSVFile = fs.existsSync(csvFile);
     if (!hasCSVFile) {
-      return res.status(404).json({ error: "Static attributes CSV file missing on server" });
+      return res.status(404).json({ error: "Static attributes CSV file missing" });
     }
     try {
-      // 路径斜杠格式化（兼容 Windows/Linux）
       const normalizedCsv = csvFile.replace(/\\/g, '/');
       const sql = `
         SELECT 
@@ -92,49 +95,50 @@ async function startServer() {
         FROM read_csv_auto('${normalizedCsv}')
       `;
       const data = await query(sql);
-      console.log(`[DuckDB] Loaded ${data.length} static grid records from local CSV.`);
+      console.log(`[DuckDB] Loaded ${data.length} static grid records.`);
       return res.json(data);
     } catch (err: any) {
-      console.error("[GET /api/static-grids] Error querying local CSV:", err);
+      console.error("[GET /api/static-grids] Error querying:", err);
       res.status(500).json({ error: err.message });
     }
   });
 
-  // API Route: Get data for a specific timestamp (读取远程 Parquet)
+  // API Route: Get data for a specific timestamp
   app.get("/api/data", async (req, res) => {
     const time = req.query.time as string;
-    const hasDBFiles = fs.existsSync(csvFile); // 只要本地 CSV 存在即进行下一步
     const hasJsonFile = fs.existsSync(jsonFile);
     
     console.log(`[GET /api/data] Time: ${time}, Source: Remote Parquet`);
 
     try {
-      if (hasDBFiles) {
-        // 直接向远程 Parquet URL 查询特定时间的数据
-        const sql = `
-          SELECT 
-            CAST(p.id AS VARCHAR) as id, 
-            CAST(p.v AS DOUBLE) as v
-          FROM read_parquet('${PARQUET_URL}') p
-          WHERE CAST(p.dt AS VARCHAR) = '${time}'
-        `;
-        const data = await query(sql);
-        console.log(`[DuckDB] Query for time ${time} found ${data.length} records.`);
-        return res.json(data);
-      } else if (hasJsonFile) {
-        const normalizedJson = jsonFile.replace(/\\/g, '/');
-        const sql = `
-          SELECT 
-            CAST(t.item.id AS VARCHAR) as id, 
-            CAST(t.item.v AS DOUBLE) as v
-          FROM (SELECT UNNEST(timeline['${time}']) as item FROM read_json_auto('${normalizedJson}')) t
-        `;
-        const data = await query(sql);
-        return res.json(data);
-      }
-      res.status(404).json({ error: "Data source files missing" });
+      // 优先从远程 Parquet 读取
+      const sql = `
+        SELECT 
+          CAST(p.id AS VARCHAR) as id, 
+          CAST(p.v AS DOUBLE) as v
+        FROM read_parquet('${PARQUET_URL}') p
+        WHERE CAST(p.dt AS VARCHAR) = '${time}'
+      `;
+      const data = await query(sql);
+      return res.json(data);
     } catch (err: any) {
-      console.error("[GET /api/data] Error querying remote Parquet:", err);
+      console.warn("[GET /api/data] Remote parquet failed, trying JSON fallback:", err.message);
+      
+      if (hasJsonFile) {
+        try {
+          const normalizedJson = jsonFile.replace(/\\/g, '/');
+          const sql = `
+            SELECT 
+              CAST(t.item.id AS VARCHAR) as id, 
+              CAST(t.item.v AS DOUBLE) as v
+            FROM (SELECT UNNEST(timeline['${time}']) as item FROM read_json_auto('${normalizedJson}')) t
+          `;
+          const data = await query(sql);
+          return res.json(data);
+        } catch (jsonErr: any) {
+          return res.status(500).json({ error: jsonErr.message });
+        }
+      }
       res.status(500).json({ error: err.message });
     }
   });
@@ -155,9 +159,9 @@ async function startServer() {
   }
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on port ${PORT}`);
-    const csvExists = fs.existsSync(csvFile);
-    console.log(`Data Status: Remote Parquet URL configured, Local CSV(${csvExists})`);
+    console.log(`Server running on http://localhost:${PORT}`);
+    const csvExists = fs.existsSync(path.resolve(process.cwd(), 'grid_static_attributes.csv'));
+    console.log(`Data Status: Remote Parquet URL configured, CSV(${csvExists})`);
   });
 }
 
