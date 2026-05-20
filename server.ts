@@ -4,6 +4,7 @@ import { createServer as createViteServer } from "vite";
 import duckdb from 'duckdb';
 const { Database } = duckdb;
 import fs from 'fs';
+import https from 'https';
 
 // BigInt JSON serialization patch
 (BigInt.prototype as any).toJSON = function() {
@@ -26,49 +27,78 @@ const query = (sql: string): Promise<any[]> => {
   });
 };
 
-// Hugging Face 直链需使用 /resolve/ 获取原始文件
+// Hugging Face 原始文件下载直链
 const PARQUET_URL = "https://huggingface.co/datasets/goosemaths/tianjin-pm25-data/resolve/main/tianjin_pm25_predictions.parquet";
+const LOCAL_PARQUET_PATH = path.resolve(process.cwd(), 'tianjin_pm25_predictions.parquet');
+
+// 自动处理重定向的下载辅助函数
+function downloadFile(url: string, dest: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    https.get(url, (response) => {
+      // 处理 Hugging Face LFS 的 301/302 重定向
+      if (response.statusCode === 301 || response.statusCode === 302) {
+        if (response.headers.location) {
+          downloadFile(response.headers.location, dest).then(resolve).catch(reject);
+          return;
+        }
+      }
+
+      if (response.statusCode !== 200) {
+        reject(new Error(`Failed to download file, status code: ${response.statusCode}`));
+        return;
+      }
+
+      const file = fs.createWriteStream(dest);
+      response.pipe(file);
+      file.on('finish', () => {
+        file.close();
+        resolve();
+      });
+    }).on('error', (err) => {
+      fs.unlink(dest, () => {}); 
+      reject(err);
+    });
+  });
+}
 
 async function startServer() {
-  const PORT = 3000;
-  
-  // Data file paths
   const csvFile = path.resolve(process.cwd(), 'grid_static_attributes.csv');
   const jsonFile = path.resolve(process.cwd(), 'data.json');
 
-  // 初始化 DuckDB 加载 httpfs 扩展以支持 HTTPS 读取
-  try {
-    await query("INSTALL httpfs; LOAD httpfs;");
-    console.log("[DuckDB] Loaded httpfs extension successfully.");
-  } catch (err) {
-    console.error("[DuckDB] Failed to load httpfs extension:", err);
+  // 启动时自动从 Hugging Face 下载/同步 Parquet 文件
+  if (!fs.existsSync(LOCAL_PARQUET_PATH)) {
+    console.log(`[Hugging Face] Downloading parquet from ${PARQUET_URL}...`);
+    try {
+      await downloadFile(PARQUET_URL, LOCAL_PARQUET_PATH);
+      console.log(`[Hugging Face] Download complete. Saved to ${LOCAL_PARQUET_PATH}`);
+    } catch (err: any) {
+      console.error("[Hugging Face] Failed to download parquet file:", err.message);
+    }
+  } else {
+    console.log(`[Hugging Face] Using cached parquet file at ${LOCAL_PARQUET_PATH}`);
   }
 
   // API Route: Get available timestamps
   app.get("/api/timestamps", async (req, res) => {
+    const hasDBFiles = fs.existsSync(LOCAL_PARQUET_PATH) && fs.existsSync(csvFile);
     const hasJsonFile = fs.existsSync(jsonFile);
     
-    console.log(`[GET /api/timestamps] Source: Remote Parquet`);
-
     try {
-      // 优先从远程 Parquet 读取
-      const result = await query(`
-        SELECT DISTINCT CAST(dt AS VARCHAR) as dt FROM read_parquet('${PARQUET_URL}') ORDER BY dt ASC
-      `);
-      return res.json(result.map(r => r.dt));
-    } catch (err: any) {
-      console.warn("[GET /api/timestamps] Remote parquet failed, trying JSON fallback:", err.message);
-      
-      if (hasJsonFile) {
-        try {
-          const result = await query(`
-            SELECT DISTINCT key FROM (SELECT UNNEST(timeline) as key FROM read_json_auto('${jsonFile}')) t
-          `);
-          return res.json(result.map(r => r.key).sort());
-        } catch (jsonErr: any) {
-          return res.status(500).json({ error: jsonErr.message });
-        }
+      if (hasDBFiles) {
+        const normalizedPath = LOCAL_PARQUET_PATH.replace(/\\/g, '/');
+        const result = await query(`
+          SELECT DISTINCT CAST(dt AS VARCHAR) as dt FROM read_parquet('${normalizedPath}') ORDER BY dt ASC
+        `);
+        return res.json(result.map(r => r.dt));
+      } else if (hasJsonFile) {
+        const result = await query(`
+          SELECT DISTINCT key FROM (SELECT UNNEST(timeline) as key FROM read_json_auto('${jsonFile}')) t
+        `);
+        return res.json(result.map(r => r.key).sort());
       }
+      
+      res.status(404).json({ error: "Data files not found" });
+    } catch (err: any) {
       res.status(500).json({ error: err.message });
     }
   });
@@ -95,10 +125,8 @@ async function startServer() {
         FROM read_csv_auto('${normalizedCsv}')
       `;
       const data = await query(sql);
-      console.log(`[DuckDB] Loaded ${data.length} static grid records.`);
       return res.json(data);
     } catch (err: any) {
-      console.error("[GET /api/static-grids] Error querying:", err);
       res.status(500).json({ error: err.message });
     }
   });
@@ -106,39 +134,34 @@ async function startServer() {
   // API Route: Get data for a specific timestamp
   app.get("/api/data", async (req, res) => {
     const time = req.query.time as string;
+    const hasDBFiles = fs.existsSync(LOCAL_PARQUET_PATH);
     const hasJsonFile = fs.existsSync(jsonFile);
     
-    console.log(`[GET /api/data] Time: ${time}, Source: Remote Parquet`);
-
     try {
-      // 优先从远程 Parquet 读取
-      const sql = `
-        SELECT 
-          CAST(p.id AS VARCHAR) as id, 
-          CAST(p.v AS DOUBLE) as v
-        FROM read_parquet('${PARQUET_URL}') p
-        WHERE CAST(p.dt AS VARCHAR) = '${time}'
-      `;
-      const data = await query(sql);
-      return res.json(data);
-    } catch (err: any) {
-      console.warn("[GET /api/data] Remote parquet failed, trying JSON fallback:", err.message);
-      
-      if (hasJsonFile) {
-        try {
-          const normalizedJson = jsonFile.replace(/\\/g, '/');
-          const sql = `
-            SELECT 
-              CAST(t.item.id AS VARCHAR) as id, 
-              CAST(t.item.v AS DOUBLE) as v
-            FROM (SELECT UNNEST(timeline['${time}']) as item FROM read_json_auto('${normalizedJson}')) t
-          `;
-          const data = await query(sql);
-          return res.json(data);
-        } catch (jsonErr: any) {
-          return res.status(500).json({ error: jsonErr.message });
-        }
+      if (hasDBFiles) {
+        const normalizedParquet = LOCAL_PARQUET_PATH.replace(/\\/g, '/');
+        const sql = `
+          SELECT 
+            CAST(p.id AS VARCHAR) as id, 
+            CAST(p.v AS DOUBLE) as v
+          FROM read_parquet('${normalizedParquet}') p
+          WHERE CAST(p.dt AS VARCHAR) = '${time}'
+        `;
+        const data = await query(sql);
+        return res.json(data);
+      } else if (hasJsonFile) {
+        const normalizedJson = jsonFile.replace(/\\/g, '/');
+        const sql = `
+          SELECT 
+            CAST(t.item.id AS VARCHAR) as id, 
+            CAST(t.item.v AS DOUBLE) as v
+          FROM (SELECT UNNEST(timeline['${time}']) as item FROM read_json_auto('${normalizedJson}')) t
+        `;
+        const data = await query(sql);
+        return res.json(data);
       }
+      res.status(404).json({ error: "Data source files missing" });
+    } catch (err: any) {
       res.status(500).json({ error: err.message });
     }
   });
@@ -160,8 +183,6 @@ async function startServer() {
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);
-    const csvExists = fs.existsSync(path.resolve(process.cwd(), 'grid_static_attributes.csv'));
-    console.log(`Data Status: Remote Parquet URL configured, CSV(${csvExists})`);
   });
 }
 
