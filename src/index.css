@@ -1,0 +1,47 @@
+@import "tailwindcss";
+@import "maplibre-gl/dist/maplibre-gl.css";
+
+@theme {
+  --color-brand-primary: #00e400;
+  --color-brand-secondary: #00aaff;
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+}
+
+@layer base {
+  body {
+    @apply bg-[#030303] text-slate-100 overflow-hidden antialiased;
+  }
+}
+
+.map-container {
+  width: 100vw;
+  height: 100vh;
+  position: absolute;
+  top: 0;
+  left: 0;
+}
+
+/* Custom scrollbar for glass panels */
+.custom-scrollbar::-webkit-scrollbar {
+  width: 5px;
+}
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 10px;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+/* Glassmorphism utility */
+.glass-panel {
+  @apply bg-[#0c0c0e]/60 backdrop-blur-2xl border border-white/10 shadow-[0_4px_32px_0_rgba(0,0,0,0.8)];
+}
+
+.brand-glow {
+  text-shadow: 0 0 12px rgba(0, 228, 0, 0.4);
+}
+

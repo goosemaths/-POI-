@@ -1,0 +1,6 @@
+{
+  "name": "Tianjin Pollution 3D Tracker",
+  "description": "A high-fidelity 3D reconstruction and AI-powered analysis tool for Tianjin's PM2.5 concentrations and urban POI density.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
