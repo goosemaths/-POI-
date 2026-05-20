@@ -13,7 +13,6 @@ import https from 'https';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// 状态标识：仅预测数据（Parquet）是否初始化完成
 let isPredictionsReady = false;
 
 const DB_PATH = '/tmp/local_cache.db';
@@ -21,8 +20,11 @@ const LOCAL_PARQUET_PATH = '/tmp/tianjin_pm25_predictions.parquet';
 const PARQUET_URL = "https://huggingface.co/datasets/goosemaths/tianjin-pm25-data/resolve/main/tianjin_pm25_predictions.parquet";
 
 const db = new Database(DB_PATH);
-db.run("PRAGMA memory_limit='64MB';");
+
+// 优化：合理调整内存限制和配置，防止 OOM
+db.run("PRAGMA memory_limit='256MB';"); // 提高至 256MB 保证分配空间
 db.run("PRAGMA threads=1;");
+db.run("SET preserve_insertion_order=false;"); // 禁用插入顺序保留以降低内存开销
 
 const query = (sql: string, params: any[] = []): Promise<any[]> => {
   return new Promise((resolve, reject) => {
@@ -60,7 +62,7 @@ function downloadFile(url: string, dest: string): Promise<void> {
   });
 }
 
-// 步骤 1：同步加载静态网格数据（速度极快，在启动前完成）
+// 步骤 1：同步加载静态网格数据
 async function initStaticGrids() {
   const csvFile = path.resolve(process.cwd(), 'grid_static_attributes.csv');
   const hasStaticTable = await query("SELECT table_name FROM information_schema.tables WHERE table_name = 'static_grids'");
@@ -68,56 +70,67 @@ async function initStaticGrids() {
   if (hasStaticTable.length === 0 && fs.existsSync(csvFile)) {
     console.log("[DuckDB] Loading static grids to disk cache...");
     const normalizedCsv = csvFile.replace(/\\/g, '/');
-    await query(`
-      CREATE TABLE static_grids AS 
-      SELECT 
-        CAST(grid_id AS VARCHAR) as id, 
-        CAST(lng_wgs84 AS DOUBLE) as lng, 
-        CAST(lat_wgs84 AS DOUBLE) as lat,
-        CAST(nearest_meteo_id AS VARCHAR) as nearest_meteo_id,
-        CAST(cnt_industrial AS INTEGER) as cnt_industrial,
-        CAST(cnt_commercial AS INTEGER) as cnt_commercial,
-        CAST(cnt_nature AS INTEGER) as cnt_nature,
-        CAST(cnt_transport AS INTEGER) as cnt_transport,
-        CAST(cnt_catering AS INTEGER) as cnt_catering
-      FROM read_csv_auto('${normalizedCsv}')
-    `);
-    console.log("[DuckDB] Static grids loaded successfully.");
+    try {
+      await query(`
+        CREATE TABLE static_grids AS 
+        SELECT 
+          CAST(grid_id AS VARCHAR) as id, 
+          CAST(lng_wgs84 AS DOUBLE) as lng, 
+          CAST(lat_wgs84 AS DOUBLE) as lat,
+          CAST(nearest_meteo_id AS VARCHAR) as nearest_meteo_id,
+          CAST(cnt_industrial AS INTEGER) as cnt_industrial,
+          CAST(cnt_commercial AS INTEGER) as cnt_commercial,
+          CAST(cnt_nature AS INTEGER) as cnt_nature,
+          CAST(cnt_transport AS INTEGER) as cnt_transport,
+          CAST(cnt_catering AS INTEGER) as cnt_catering
+        FROM read_csv_auto('${normalizedCsv}')
+      `);
+      console.log("[DuckDB] Static grids loaded successfully.");
+    } catch (err) {
+      // 容错处理：导入失败时清理半截表格，防止下次启动报错
+      await query("DROP TABLE IF EXISTS static_grids;");
+      throw err;
+    }
   }
 }
 
-// 步骤 2：异步加载时序预测数据（后台运行）
+// 步骤 2：异步加载时序数据
 async function initPredictions() {
   const jsonFile = path.resolve(process.cwd(), 'data.json');
   const hasPredictionsTable = await query("SELECT table_name FROM information_schema.tables WHERE table_name = 'predictions'");
   
   if (hasPredictionsTable.length === 0) {
-    if (fs.existsSync(LOCAL_PARQUET_PATH)) {
-      console.log("[DuckDB] Importing predictions from Parquet to disk...");
-      const normalizedParquet = LOCAL_PARQUET_PATH.replace(/\\/g, '/');
-      await query(`
-        CREATE TABLE predictions AS 
-        SELECT CAST(dt AS VARCHAR) as dt, CAST(id AS VARCHAR) as id, CAST(v AS DOUBLE) as v 
-        FROM read_parquet('${normalizedParquet}')
-      `);
-      await query(`CREATE INDEX IF NOT EXISTS idx_pred_dt ON predictions (dt)`);
-    } else if (fs.existsSync(jsonFile)) {
-      console.log("[DuckDB] Importing predictions from JSON...");
-      const normalizedJson = jsonFile.replace(/\\/g, '/');
-      await query(`
-        CREATE TABLE predictions AS
-        SELECT 
-          CAST(kv.key AS VARCHAR) as dt,
-          CAST(val.id AS VARCHAR) as id,
-          CAST(val.v AS DOUBLE) as v
-        FROM (
-          SELECT UNNEST(struct_entries(timeline)) as kv 
-          FROM read_json_auto('${normalizedJson}')
-        ), LATERAL (
-          SELECT UNNEST(kv.value) as val
-        )
-      `);
-      await query(`CREATE INDEX IF NOT EXISTS idx_pred_dt ON predictions (dt)`);
+    try {
+      if (fs.existsSync(LOCAL_PARQUET_PATH)) {
+        console.log("[DuckDB] Importing predictions from Parquet to disk...");
+        const normalizedParquet = LOCAL_PARQUET_PATH.replace(/\\/g, '/');
+        await query(`
+          CREATE TABLE predictions AS 
+          SELECT CAST(dt AS VARCHAR) as dt, CAST(id AS VARCHAR) as id, CAST(v AS DOUBLE) as v 
+          FROM read_parquet('${normalizedParquet}')
+        `);
+        await query(`CREATE INDEX IF NOT EXISTS idx_pred_dt ON predictions (dt)`);
+      } else if (fs.existsSync(jsonFile)) {
+        console.log("[DuckDB] Importing predictions from JSON...");
+        const normalizedJson = jsonFile.replace(/\\/g, '/');
+        await query(`
+          CREATE TABLE predictions AS
+          SELECT 
+            CAST(kv.key AS VARCHAR) as dt,
+            CAST(val.id AS VARCHAR) as id,
+            CAST(val.v AS DOUBLE) as v
+          FROM (
+            SELECT UNNEST(struct_entries(timeline)) as kv 
+            FROM read_json_auto('${normalizedJson}')
+          ), LATERAL (
+            SELECT UNNEST(kv.value) as val
+          )
+        `);
+        await query(`CREATE INDEX IF NOT EXISTS idx_pred_dt ON predictions (dt)`);
+      }
+    } catch (err) {
+      await query("DROP TABLE IF EXISTS predictions;");
+      throw err;
     }
   }
 }
@@ -136,7 +149,7 @@ async function runBackgroundInitialization() {
   }
 }
 
-// 静态网格接口无需拦截；仅对未准备好的时序数据接口拦截
+// 状态拦截
 app.use((req, res, next) => {
   const isPredictionApi = req.path.startsWith('/api/timestamps') || req.path.startsWith('/api/data');
   if (isPredictionApi && !isPredictionsReady) {
@@ -145,7 +158,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// API 路由: 静态网格（立即可用）
+// API 路由: 静态网格
 app.get("/api/static-grids", async (req, res) => {
   try {
     const data = await query(`SELECT * FROM static_grids`);
@@ -155,7 +168,7 @@ app.get("/api/static-grids", async (req, res) => {
   }
 });
 
-// API 路由: 时序相关（后台初始化完成后可用）
+// API 路由: 时序相关
 app.get("/api/timestamps", async (req, res) => {
   try {
     const result = await query(`SELECT DISTINCT dt FROM predictions ORDER BY dt ASC`);
@@ -178,7 +191,6 @@ app.get("/api/data", async (req, res) => {
 });
 
 async function startServer() {
-  // 1. 同步加载极快的网格数据，确保服务启动时此接口 100% 可用
   try {
     await initStaticGrids();
   } catch (err: any) {
@@ -199,11 +211,8 @@ async function startServer() {
     });
   }
 
-  // 2. 绑定端口
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on port ${PORT}`);
-    
-    // 3. 在后台静默加载大文件
     runBackgroundInitialization();
   });
 }
