@@ -13,10 +13,9 @@ import https from 'https';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// 状态标识：数据库是否初始化完成
-let isDbReady = false;
+// 状态标识：仅预测数据（Parquet）是否初始化完成
+let isPredictionsReady = false;
 
-// 将缓存文件移至读写更稳定快速的 /tmp 目录
 const DB_PATH = '/tmp/local_cache.db';
 const LOCAL_PARQUET_PATH = '/tmp/tianjin_pm25_predictions.parquet';
 const PARQUET_URL = "https://huggingface.co/datasets/goosemaths/tianjin-pm25-data/resolve/main/tianjin_pm25_predictions.parquet";
@@ -61,14 +60,13 @@ function downloadFile(url: string, dest: string): Promise<void> {
   });
 }
 
-async function initDatabase() {
+// 步骤 1：同步加载静态网格数据（速度极快，在启动前完成）
+async function initStaticGrids() {
   const csvFile = path.resolve(process.cwd(), 'grid_static_attributes.csv');
-  const jsonFile = path.resolve(process.cwd(), 'data.json');
-
-  // 1. 导入 static_grids 表
   const hasStaticTable = await query("SELECT table_name FROM information_schema.tables WHERE table_name = 'static_grids'");
+  
   if (hasStaticTable.length === 0 && fs.existsSync(csvFile)) {
-    console.log("[DuckDB] Importing static grids to disk cache...");
+    console.log("[DuckDB] Loading static grids to disk cache...");
     const normalizedCsv = csvFile.replace(/\\/g, '/');
     await query(`
       CREATE TABLE static_grids AS 
@@ -84,13 +82,18 @@ async function initDatabase() {
         CAST(cnt_catering AS INTEGER) as cnt_catering
       FROM read_csv_auto('${normalizedCsv}')
     `);
+    console.log("[DuckDB] Static grids loaded successfully.");
   }
+}
 
-  // 2. 导入 predictions 表
+// 步骤 2：异步加载时序预测数据（后台运行）
+async function initPredictions() {
+  const jsonFile = path.resolve(process.cwd(), 'data.json');
   const hasPredictionsTable = await query("SELECT table_name FROM information_schema.tables WHERE table_name = 'predictions'");
+  
   if (hasPredictionsTable.length === 0) {
     if (fs.existsSync(LOCAL_PARQUET_PATH)) {
-      console.log("[DuckDB] Importing predictions to disk cache...");
+      console.log("[DuckDB] Importing predictions from Parquet to disk...");
       const normalizedParquet = LOCAL_PARQUET_PATH.replace(/\\/g, '/');
       await query(`
         CREATE TABLE predictions AS 
@@ -119,43 +122,44 @@ async function initDatabase() {
   }
 }
 
-// 异步后台初始化任务，避免阻塞启动
 async function runBackgroundInitialization() {
   try {
     if (!fs.existsSync(LOCAL_PARQUET_PATH)) {
       console.log("[Background] Downloading parquet file...");
       await downloadFile(PARQUET_URL, LOCAL_PARQUET_PATH);
     }
-    await initDatabase();
-    isDbReady = true;
-    console.log("[Background] Database cache initialization complete. Service is ready.");
+    await initPredictions();
+    isPredictionsReady = true;
+    console.log("[Background] Predictions cache initialized. System ready.");
   } catch (err: any) {
     console.error("[Background] Initialization failed:", err.message);
   }
 }
 
-// 拦截器：当数据未就绪时告知客户端等待
+// 静态网格接口无需拦截；仅对未准备好的时序数据接口拦截
 app.use((req, res, next) => {
-  if (req.path.startsWith('/api/') && !isDbReady) {
-    return res.status(503).json({ error: "Service is starting up, please try again shortly." });
+  const isPredictionApi = req.path.startsWith('/api/timestamps') || req.path.startsWith('/api/data');
+  if (isPredictionApi && !isPredictionsReady) {
+    return res.status(503).json({ error: "Prediction data is loading, please try again shortly." });
   }
   next();
 });
 
-// API 路由
-app.get("/api/timestamps", async (req, res) => {
+// API 路由: 静态网格（立即可用）
+app.get("/api/static-grids", async (req, res) => {
   try {
-    const result = await query(`SELECT DISTINCT dt FROM predictions ORDER BY dt ASC`);
-    return res.json(result.map(r => r.dt));
+    const data = await query(`SELECT * FROM static_grids`);
+    return res.json(data);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.get("/api/static-grids", async (req, res) => {
+// API 路由: 时序相关（后台初始化完成后可用）
+app.get("/api/timestamps", async (req, res) => {
   try {
-    const data = await query(`SELECT * FROM static_grids`);
-    return res.json(data);
+    const result = await query(`SELECT DISTINCT dt FROM predictions ORDER BY dt ASC`);
+    return res.json(result.map(r => r.dt));
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -174,6 +178,13 @@ app.get("/api/data", async (req, res) => {
 });
 
 async function startServer() {
+  // 1. 同步加载极快的网格数据，确保服务启动时此接口 100% 可用
+  try {
+    await initStaticGrids();
+  } catch (err: any) {
+    console.error("[DuckDB] Static grids load failed:", err.message);
+  }
+
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -188,11 +199,11 @@ async function startServer() {
     });
   }
 
-  // 1. 立即启动端口监听（避免 Render 502 启动超时）
+  // 2. 绑定端口
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on port ${PORT}`);
     
-    // 2. 启动后，在后台静默下载并载入数据
+    // 3. 在后台静默加载大文件
     runBackgroundInitialization();
   });
 }
