@@ -4,36 +4,16 @@ import { createServer as createViteServer } from "vite";
 import duckdb from 'duckdb';
 const { Database } = duckdb;
 import fs from 'fs';
-import https from 'https'; // 引入 https 模块用于下载
+import https from 'https';
 
 // BigInt JSON serialization patch
 (BigInt.prototype as any).toJSON = function() {
   return Number(this);
 };
 
-// 修复 1：Render 要求必须绑定 process.env.PORT
-const PORT = process.env.PORT || 3000;
-
-// Initialize DuckDB (In-memory, we will query files directly)
-const db = new Database(':memory:');
-
-// 修复 2：严格限制 DuckDB 资源，防止在 Render 512MB 环境下 OOM
-db.run("PRAGMA memory_limit='128MB';");
-db.run("PRAGMA threads=1;");
-
-// Helper to run DuckDB queries
-const query = (sql: string): Promise<any[]> => {
-  return new Promise((resolve, reject) => {
-    db.all(sql, (err, res) => {
-      if (err) reject(err);
-      else resolve(res);
-    });
-  });
-};
-
 const PARQUET_URL = "https://huggingface.co/datasets/goosemaths/tianjin-pm25-data/resolve/main/tianjin_pm25_predictions.parquet";
 
-// 流式下载工具，不占用 Node.js 额外内存空间
+// 流式下载工具
 function downloadFile(url: string, dest: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const request = https.get(url, (response) => {
@@ -62,62 +42,93 @@ function downloadFile(url: string, dest: string): Promise<void> {
 }
 
 async function startServer() {
+  // 修复 1：将 app 与 PORT 声明移至函数内部，防止打包工具混淆作用域
+  const app = express();
+  const PORT = process.env.PORT || 3000;
+
+  // Initialize DuckDB 并限制运行资源
+  const db = new Database(':memory:');
+  db.run("PRAGMA memory_limit='128MB';");
+  db.run("PRAGMA threads=1;");
+
+  const query = (sql: string): Promise<any[]> => {
+    return new Promise((resolve, reject) => {
+      db.all(sql, (err, res) => {
+        if (err) reject(err);
+        else resolve(res);
+      });
+    });
+  };
+
   // Data file paths
   const parquetFile = path.resolve(process.cwd(), 'tianjin_pm25_predictions.parquet');
   const csvFile = path.resolve(process.cwd(), 'grid_static_attributes.csv');
   const jsonFile = path.resolve(process.cwd(), 'data.json');
 
-  // 修复 3：启动时若缺失文件，优先从 Hugging Face 下载真实数据
+  let isDownloading = false;
+
+  // 修复 2：异步下载，不阻塞主线程启动以防 Render 检测端口超时
   if (!fs.existsSync(parquetFile)) {
-    console.log(`[Hugging Face] Downloading dataset from ${PARQUET_URL}...`);
-    try {
-      await downloadFile(PARQUET_URL, parquetFile);
-      console.log(`[Hugging Face] Download complete.`);
-    } catch (downloadErr: any) {
-      console.error("[Hugging Face] Download failed, falling back to Self-Healing generation...", downloadErr.message);
-      
-      // 下载失败时，降级使用您原有的自愈逻辑生成虚拟数据
-      if (fs.existsSync(csvFile)) {
-        console.log(`[Self-Healing] Generating default predictions from static attributes...`);
-        try {
-          const sqlGenerate = `
-            COPY (
-              SELECT 
-                t.dt,
-                s.grid_id as id,
-                CAST((30.0 + random() * 45.0 + (CAST(s.cnt_industrial AS DOUBLE) * 12.0) + (CAST(s.cnt_transport AS DOUBLE) * 8.0) + (CAST(s.cnt_commercial AS DOUBLE) * 5.0)) AS DOUBLE) as v
-              FROM read_csv_auto('${csvFile.replace(/\\/g, '/')}') s
-              CROSS JOIN (
-                SELECT '2025-12-23 14:00:00' as dt UNION ALL
-                SELECT '2025-12-23 15:00:00' UNION ALL
-                SELECT '2025-12-23 16:00:00' UNION ALL
-                SELECT '2025-12-23 17:00:00' UNION ALL
-                SELECT '2025-12-23 18:00:00' UNION ALL
-                SELECT '2025-12-23 19:00:00' UNION ALL
-                SELECT '2025-12-23 20:00:00' UNION ALL
-                SELECT '2025-12-23 21:00:00' UNION ALL
-                SELECT '2025-12-23 22:00:00' UNION ALL
-                SELECT '2025-12-23 23:00:00' UNION ALL
-                SELECT '2026-03-29 00:00:00' as dt
-              ) t
-            ) TO '${parquetFile.replace(/\\/g, '/')}' (FORMAT PARQUET);
-          `;
-          await query(sqlGenerate);
-          console.log(`[Self-Healing] Successfully generated ${parquetFile}`);
-        } catch (err) {
-          console.error("[Self-Healing] Failed to generate parquet file:", err);
+    isDownloading = true;
+    console.log(`[Hugging Face] Downloading parquet from ${PARQUET_URL}...`);
+    
+    downloadFile(PARQUET_URL, parquetFile)
+      .then(() => {
+        console.log(`[Hugging Face] Download complete.`);
+        isDownloading = false;
+      })
+      .catch(async (err) => {
+        console.error("[Hugging Face] Download failed, falling back to Self-Healing...", err.message);
+        
+        if (fs.existsSync(csvFile)) {
+          console.log(`[Self-Healing] Generating default predictions...`);
+          try {
+            const sqlGenerate = `
+              COPY (
+                SELECT 
+                  t.dt,
+                  s.grid_id as id,
+                  CAST((30.0 + random() * 45.0 + (CAST(s.cnt_industrial AS DOUBLE) * 12.0) + (CAST(s.cnt_transport AS DOUBLE) * 8.0) + (CAST(s.cnt_commercial AS DOUBLE) * 5.0)) AS DOUBLE) as v
+                FROM read_csv_auto('${csvFile.replace(/\\/g, '/')}') s
+                CROSS JOIN (
+                  SELECT '2025-12-23 14:00:00' as dt UNION ALL
+                  SELECT '2025-12-23 15:00:00' UNION ALL
+                  SELECT '2025-12-23 16:00:00' UNION ALL
+                  SELECT '2025-12-23 17:00:00' UNION ALL
+                  SELECT '2025-12-23 18:00:00' UNION ALL
+                  SELECT '2025-12-23 19:00:00' UNION ALL
+                  SELECT '2025-12-23 20:00:00' UNION ALL
+                  SELECT '2025-12-23 21:00:00' UNION ALL
+                  SELECT '2025-12-23 22:00:00' UNION ALL
+                  SELECT '2025-12-23 23:00:00' UNION ALL
+                  SELECT '2026-03-29 00:00:00' as dt
+                ) t
+              ) TO '${parquetFile.replace(/\\/g, '/')}' (FORMAT PARQUET);
+            `;
+            await query(sqlGenerate);
+            console.log(`[Self-Healing] Successfully generated ${parquetFile}`);
+          } catch (genErr) {
+            console.error("[Self-Healing] Failed to generate parquet file:", genErr);
+          }
         }
-      }
-    }
+        isDownloading = false;
+      });
   }
+
+  // 拦截器：文件未下载完成时拦截时序请求
+  app.use((req, res, next) => {
+    const isPredictionApi = req.path.startsWith('/api/timestamps') || req.path.startsWith('/api/data');
+    if (isPredictionApi && isDownloading) {
+      return res.status(503).json({ error: "Data files are downloading, please try again in a few seconds." });
+    }
+    next();
+  });
 
   // API Route: Get available timestamps
   app.get("/api/timestamps", async (req, res) => {
     const hasDBFiles = fs.existsSync(parquetFile) && fs.existsSync(csvFile);
     const hasJsonFile = fs.existsSync(jsonFile);
     
-    console.log(`[GET /api/timestamps] Files: Parquet(${fs.existsSync(parquetFile)}), CSV(${fs.existsSync(csvFile)}), JSON(${hasJsonFile})`);
-
     try {
       if (hasDBFiles) {
         const result = await query(`
@@ -130,18 +141,13 @@ async function startServer() {
         `);
         return res.json(result.map(r => r.key).sort());
       }
-      
-      console.error(`Data files missing. Looked for: ${parquetFile} and ${csvFile}`);
-      res.status(404).json({ 
-        error: "Data files not found", 
-        checked: { parquet: parquetFile, csv: csvFile, exists: { parquet: fs.existsSync(parquetFile), csv: fs.existsSync(csvFile) } } 
-      });
+      res.status(404).json({ error: "Data files not found" });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }
   });
 
-  // API Route: Get static grid attributes (loaded once at startup)
+  // API Route: Get static grid attributes (静态网格立即可用)
   app.get("/api/static-grids", async (req, res) => {
     const hasCSVFile = fs.existsSync(csvFile);
     if (!hasCSVFile) {
@@ -163,22 +169,18 @@ async function startServer() {
         FROM read_csv_auto('${normalizedCsv}')
       `;
       const data = await query(sql);
-      console.log(`[DuckDB] Loaded ${data.length} static grid records.`);
       return res.json(data);
     } catch (err: any) {
-      console.error("[GET /api/static-grids] Error querying:", err);
       res.status(500).json({ error: err.message });
     }
   });
 
-  // API Route: Get data for a specific timestamp (dynamic-only payload, optimized)
+  // API Route: Get data for a specific timestamp
   app.get("/api/data", async (req, res) => {
     const time = req.query.time as string;
     const hasDBFiles = fs.existsSync(parquetFile);
     const hasJsonFile = fs.existsSync(jsonFile);
     
-    console.log(`[GET /api/data] Time: ${time}, Source: ${hasDBFiles ? 'DuckDB (Parquet Only)' : (hasJsonFile ? 'JSON' : 'None')}`);
-
     try {
       if (hasDBFiles) {
         const normalizedParquet = parquetFile.replace(/\\/g, '/');
@@ -190,10 +192,6 @@ async function startServer() {
           WHERE CAST(p.dt AS VARCHAR) = '${time}'
         `;
         const data = await query(sql);
-        console.log(`[DuckDB] Query for time ${time} found ${data.length} records.`);
-        if (data.length > 0) {
-           console.log(`[DuckDB] Sample dynamic: ID: ${data[0].id}, V: ${data[0].v}`);
-        }
         return res.json(data);
       } else if (hasJsonFile) {
         const normalizedJson = jsonFile.replace(/\\/g, '/');
@@ -208,7 +206,6 @@ async function startServer() {
       }
       res.status(404).json({ error: "Data source files missing" });
     } catch (err: any) {
-      console.error("[GET /api/data] Error querying:", err);
       res.status(500).json({ error: err.message });
     }
   });
@@ -228,12 +225,9 @@ async function startServer() {
     });
   }
 
-  // 修复 4：改为使用分配的 PORT
+  // 立即绑定端口，通过 Render 的健康检测
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on port ${PORT}`);
-    const parquetExists = fs.existsSync(path.resolve(process.cwd(), 'tianjin_pm25_predictions.parquet'));
-    const csvExists = fs.existsSync(path.resolve(process.cwd(), 'grid_static_attributes.csv'));
-    console.log(`Data Status: Parquet(${parquetExists}), CSV(${csvExists})`);
   });
 }
 
