@@ -4,7 +4,6 @@ import { createServer as createViteServer } from "vite";
 import duckdb from 'duckdb';
 const { Database } = duckdb;
 import fs from 'fs';
-import https from 'https';
 
 // BigInt JSON serialization patch
 (BigInt.prototype as any).toJSON = function() {
@@ -12,7 +11,8 @@ import https from 'https';
 };
 
 const app = express();
-const PORT = 3000;
+// 修复 1：动态获取 Render 提供的端口，避免绑定失败
+const PORT = process.env.PORT || 3000;
 
 // Initialize DuckDB (In-memory)
 const db = new Database(':memory:');
@@ -27,45 +27,24 @@ const query = (sql: string): Promise<any[]> => {
   });
 };
 
-// Hugging Face 原始文件下载直链
 const PARQUET_URL = "https://huggingface.co/datasets/goosemaths/tianjin-pm25-data/resolve/main/tianjin_pm25_predictions.parquet";
 const LOCAL_PARQUET_PATH = path.resolve(process.cwd(), 'tianjin_pm25_predictions.parquet');
 
-// 自动处理重定向的下载辅助函数
-function downloadFile(url: string, dest: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    https.get(url, (response) => {
-      // 处理 Hugging Face LFS 的 301/302 重定向
-      if (response.statusCode === 301 || response.statusCode === 302) {
-        if (response.headers.location) {
-          downloadFile(response.headers.location, dest).then(resolve).catch(reject);
-          return;
-        }
-      }
-
-      if (response.statusCode !== 200) {
-        reject(new Error(`Failed to download file, status code: ${response.statusCode}`));
-        return;
-      }
-
-      const file = fs.createWriteStream(dest);
-      response.pipe(file);
-      file.on('finish', () => {
-        file.close();
-        resolve();
-      });
-    }).on('error', (err) => {
-      fs.unlink(dest, () => {}); 
-      reject(err);
-    });
-  });
+// 修复 2：使用更稳定的内置 fetch API 自动处理重定向与文件写入
+async function downloadFile(url: string, dest: string): Promise<void> {
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`HTTP error! status: ${response.status}`);
+  }
+  const arrayBuffer = await response.arrayBuffer();
+  await fs.promises.writeFile(dest, Buffer.from(arrayBuffer));
 }
 
 async function startServer() {
   const csvFile = path.resolve(process.cwd(), 'grid_static_attributes.csv');
   const jsonFile = path.resolve(process.cwd(), 'data.json');
 
-  // 启动时自动从 Hugging Face 下载/同步 Parquet 文件
+  // 启动时同步 Parquet 数据
   if (!fs.existsSync(LOCAL_PARQUET_PATH)) {
     console.log(`[Hugging Face] Downloading parquet from ${PARQUET_URL}...`);
     try {
@@ -181,8 +160,9 @@ async function startServer() {
     });
   }
 
+  // 绑定至 Render 分配的端口
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+    console.log(`Server running on port ${PORT}`);
   });
 }
 
