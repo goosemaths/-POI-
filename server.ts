@@ -13,11 +13,16 @@ import https from 'https';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// 优化：使用本地磁盘文件作为缓存数据库，避免占用 512MB 运行内存
-const DB_PATH = path.resolve(process.cwd(), 'local_cache.db');
-const db = new Database(DB_PATH);
+// 状态标识：数据库是否初始化完成
+let isDbReady = false;
 
-db.run("PRAGMA memory_limit='64MB';"); // 进一步压低内存限制
+// 将缓存文件移至读写更稳定快速的 /tmp 目录
+const DB_PATH = '/tmp/local_cache.db';
+const LOCAL_PARQUET_PATH = '/tmp/tianjin_pm25_predictions.parquet';
+const PARQUET_URL = "https://huggingface.co/datasets/goosemaths/tianjin-pm25-data/resolve/main/tianjin_pm25_predictions.parquet";
+
+const db = new Database(DB_PATH);
+db.run("PRAGMA memory_limit='64MB';");
 db.run("PRAGMA threads=1;");
 
 const query = (sql: string, params: any[] = []): Promise<any[]> => {
@@ -28,9 +33,6 @@ const query = (sql: string, params: any[] = []): Promise<any[]> => {
     });
   });
 };
-
-const PARQUET_URL = "https://huggingface.co/datasets/goosemaths/tianjin-pm25-data/resolve/main/tianjin_pm25_predictions.parquet";
-const LOCAL_PARQUET_PATH = path.resolve(process.cwd(), 'tianjin_pm25_predictions.parquet');
 
 function downloadFile(url: string, dest: string): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -59,12 +61,11 @@ function downloadFile(url: string, dest: string): Promise<void> {
   });
 }
 
-// 初始化磁盘缓存表
 async function initDatabase() {
   const csvFile = path.resolve(process.cwd(), 'grid_static_attributes.csv');
   const jsonFile = path.resolve(process.cwd(), 'data.json');
 
-  // 1. 检查并导入 static_grids 表
+  // 1. 导入 static_grids 表
   const hasStaticTable = await query("SELECT table_name FROM information_schema.tables WHERE table_name = 'static_grids'");
   if (hasStaticTable.length === 0 && fs.existsSync(csvFile)) {
     console.log("[DuckDB] Importing static grids to disk cache...");
@@ -85,21 +86,20 @@ async function initDatabase() {
     `);
   }
 
-  // 2. 检查并导入 predictions 表
+  // 2. 导入 predictions 表
   const hasPredictionsTable = await query("SELECT table_name FROM information_schema.tables WHERE table_name = 'predictions'");
   if (hasPredictionsTable.length === 0) {
     if (fs.existsSync(LOCAL_PARQUET_PATH)) {
-      console.log("[DuckDB] Importing predictions from Parquet to disk cache...");
+      console.log("[DuckDB] Importing predictions to disk cache...");
       const normalizedParquet = LOCAL_PARQUET_PATH.replace(/\\/g, '/');
       await query(`
         CREATE TABLE predictions AS 
         SELECT CAST(dt AS VARCHAR) as dt, CAST(id AS VARCHAR) as id, CAST(v AS DOUBLE) as v 
         FROM read_parquet('${normalizedParquet}')
       `);
-      // 建立索引，大幅提升多用户并发查询时的检索速度，同时降低 CPU 消耗
       await query(`CREATE INDEX IF NOT EXISTS idx_pred_dt ON predictions (dt)`);
     } else if (fs.existsSync(jsonFile)) {
-      console.log("[DuckDB] Importing predictions from JSON to disk cache...");
+      console.log("[DuckDB] Importing predictions from JSON...");
       const normalizedJson = jsonFile.replace(/\\/g, '/');
       await query(`
         CREATE TABLE predictions AS
@@ -117,55 +117,63 @@ async function initDatabase() {
       await query(`CREATE INDEX IF NOT EXISTS idx_pred_dt ON predictions (dt)`);
     }
   }
-  console.log("[DuckDB] Database tables verified and ready.");
 }
 
-async function startServer() {
-  if (!fs.existsSync(LOCAL_PARQUET_PATH)) {
-    console.log(`[Hugging Face] Downloading parquet from ${PARQUET_URL}...`);
-    try {
+// 异步后台初始化任务，避免阻塞启动
+async function runBackgroundInitialization() {
+  try {
+    if (!fs.existsSync(LOCAL_PARQUET_PATH)) {
+      console.log("[Background] Downloading parquet file...");
       await downloadFile(PARQUET_URL, LOCAL_PARQUET_PATH);
-    } catch (err: any) {
-      console.error("[Hugging Face] Failed to download parquet file:", err.message);
     }
+    await initDatabase();
+    isDbReady = true;
+    console.log("[Background] Database cache initialization complete. Service is ready.");
+  } catch (err: any) {
+    console.error("[Background] Initialization failed:", err.message);
   }
+}
+
+// 拦截器：当数据未就绪时告知客户端等待
+app.use((req, res, next) => {
+  if (req.path.startsWith('/api/') && !isDbReady) {
+    return res.status(503).json({ error: "Service is starting up, please try again shortly." });
+  }
+  next();
+});
+
+// API 路由
+app.get("/api/timestamps", async (req, res) => {
+  try {
+    const result = await query(`SELECT DISTINCT dt FROM predictions ORDER BY dt ASC`);
+    return res.json(result.map(r => r.dt));
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/static-grids", async (req, res) => {
+  try {
+    const data = await query(`SELECT * FROM static_grids`);
+    return res.json(data);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/data", async (req, res) => {
+  const time = req.query.time as string;
+  if (!time) return res.status(400).json({ error: "Missing time parameter" });
 
   try {
-    await initDatabase();
+    const data = await query(`SELECT id, v FROM predictions WHERE dt = ?`, [time]);
+    return res.json(data);
   } catch (err: any) {
-    console.error("[DuckDB] Error initializing database:", err.message);
+    res.status(500).json({ error: err.message });
   }
+});
 
-  app.get("/api/timestamps", async (req, res) => {
-    try {
-      const result = await query(`SELECT DISTINCT dt FROM predictions ORDER BY dt ASC`);
-      return res.json(result.map(r => r.dt));
-    } catch (err: any) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  app.get("/api/static-grids", async (req, res) => {
-    try {
-      const data = await query(`SELECT * FROM static_grids`);
-      return res.json(data);
-    } catch (err: any) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  app.get("/api/data", async (req, res) => {
-    const time = req.query.time as string;
-    if (!time) return res.status(400).json({ error: "Missing time parameter" });
-
-    try {
-      const data = await query(`SELECT id, v FROM predictions WHERE dt = ?`, [time]);
-      return res.json(data);
-    } catch (err: any) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
+async function startServer() {
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -180,8 +188,12 @@ async function startServer() {
     });
   }
 
+  // 1. 立即启动端口监听（避免 Render 502 启动超时）
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on port ${PORT}`);
+    
+    // 2. 启动后，在后台静默下载并载入数据
+    runBackgroundInitialization();
   });
 }
 
